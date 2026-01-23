@@ -17,6 +17,11 @@ using Random
             @test_throws ArgumentError Korg.Fit.validate_params((Teff=4500, logg=3200, M_H=0.1),
                                                                 (; M_H=0.1))
 
+            @test_throws ArgumentError Korg.Fit.validate_params_errors((; Teff=320), (;))
+            @test_throws ArgumentError Korg.Fit.validate_params_errors((; logg=1), (;))
+            @test_throws ArgumentError Korg.Fit.validate_params_errors((Teff_err=100, logg_err=1, M_H_err=0.1),
+                                                                (; M_H=0.1))
+
             @test_throws "Use M_H instead" Korg.Fit.validate_params((; m_H=0.1, Teff=5000,
                                                                      logg=4.5), (;))
             @test_throws "Use M_H instead" Korg.Fit.validate_params((; Teff=5000, logg=4.5),
@@ -120,6 +125,29 @@ using Random
                                       rtol=0.001)
             end
 
+            @testset "fit test priors" begin
+                result = Korg.Fit.fit_spectrum_priors(obs_wls, fake_data, err, linelist, p0, fixed_params;
+                                               precision=1e-2, # loose tolerances for speed
+                                               postprocess=perturb!,
+                                               adjust_continuum=true,
+                                               R=R,
+                                               windows=windows,)
+
+                params, Σ = result.covariance
+
+                Teff_index = findfirst(params .== "Teff")
+                Teff_sigma = sqrt(Σ[Teff_index, Teff_index])
+                M_H_index = findfirst(params .== "M_H")
+                M_H_sigma = sqrt(Σ[M_H_index, M_H_index])
+
+                # check that inferred parameters are within 1 sigma of the true values
+                @test result.best_fit_params["Teff"]≈Teff atol=Teff_sigma
+                @test result.best_fit_params["M_H"]≈M_H atol=M_H_sigma
+
+                # check that best-fit flux is within 1% of the true flux at all pixels
+                @test assert_allclose(fake_data[result.obs_wl_mask], result.best_fit_flux,
+                                      rtol=0.001)
+            end
             # get rid of the bad pixels to make it easer to test the error messages below
             fake_data[1:3] .= 0
 

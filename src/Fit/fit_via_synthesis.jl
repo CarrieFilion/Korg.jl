@@ -1,5 +1,6 @@
 using LineSearches, Optim
 using Interpolations: linear_interpolation, Line
+using Distributions: Normal, logpdf
 
 # used by scale and unscale for some parameters
 function tan_scale(p, lower, upper)
@@ -389,6 +390,163 @@ function fit_spectrum(obs_wls, obs_flux, obs_err, linelist, initial_guesses, fix
     (best_fit_params=best_fit_params, best_fit_flux=best_fit_flux, obs_wl_mask=obs_wl_mask,
      solver_result=res, trace=trace, covariance=(params_to_fit, invH))
 end
+
+"""
+Validate parameters for the prior/errors
+
+    hmmmm.... do I want to have errors on the fixed params...? no, right?
+    currently only 
+"""
+function validate_params_errors(initial_guess_errors::AbstractDict, fixed_params::AbstractDict;
+                         required_params=["Teff", "logg"],
+                         default_params=Dict("M_H" => 0.0, "M_H_err"=>0.1, "vsini" => 0.0, "vsini_err"=>0.1, "vmic" => 1.0,
+                                             "vmic_err"=>0.1, "epsilon" => 0.6, "cntm_offset" => 0.0,
+                                             "cntm_slope" => 0.0, "Teff_err"=>100.0, "logg_err"=>0.1),
+                         allowed_params=Set(["alpha_H"; required_params; keys(default_params)...;
+                                             Korg.atomic_symbols]))
+    # convert all parameter values to Float64
+    initial_guess_errors = Dict(string(p[1]) => Float64(p[2]) for p in pairs(initial_guess_errors))
+    fixed_params = Dict(string(p[1]) => Float64(p[2]) for p in pairs(fixed_params))
+
+    # check that all required params are specified
+    all_params = keys(initial_guess_errors) ∪ keys(fixed_params)
+    for param in required_params
+        if !(param in all_params)
+            throw(ArgumentError("Must specify $param in either initial_guesses or fixed_params. (Did you get the capitalization right?)"))
+        end
+    end
+
+    # check that all the params are recognized
+    unknown_params = filter!(all_params) do param
+        if param == "m_H"
+            throw(ArgumentError("m_H is no longer a supported keyword argument of fit_spectrum (starting in Korg 1.0). Use M_H instead."))
+        end
+        param ∉ allowed_params
+    end
+    if length(unknown_params) > 0
+        throw(ArgumentError("These parameters are not recognized: $(unknown_params)"))
+    end
+
+    # filter out those that the user specified, and fill in the rest
+    default_params = filter(collect(pairs(default_params))) do (k, v)
+        !(k in keys(initial_guess_errors)) && !(k in keys(fixed_params))
+    end |> Dict
+    fixed_params = merge(default_params, fixed_params)
+
+    # check that no params are both fixed and initial guesses
+    let keys_in_both = collect(keys(initial_guess_errors) ∩ keys(fixed_params))
+        if length(keys_in_both) > 0
+            throw(ArgumentError("These parameters: $(keys_in_both) are specified as both initial guesses and fixed params."))
+        end
+    end
+
+    if "cntm_offset" in keys(initial_guess_errors) || "cntm_slope" in keys(initial_guess_errors)
+        @warn "Instead of using the `\"cntm_offset\"`` and `\"cntm_slope\"` parameters, it's now" *
+              " recommended to pass `adjust_continuum=true` to Korg.Fit.fit_spectrum. These parameters " *
+              "may be removed in a future version of Korg."
+    end
+
+    initial_guess_errors, fixed_params
+end
+"""
+my attempt to add priors to the input estimates, include a continuum term 
+priors are going to start off as gaussian 
+using Distributions
+test = Normal(0, 1)
+logpdf(test, 134), pdf(test, 0)
+
+realistically want to build all this in as like a 'prior mode' on the original function
+    also need to add some more edge cases and error checking. Thinking  we want to enforce symmetric errors
+
+"""
+function fit_spectrum_priors(obs_wls, obs_flux, obs_err, linelist, initial_guesses, fixed_params=(;);
+    initial_guess_errors = (;);
+    windows=nothing, R=nothing, LSF_matrix=nothing, synthesis_wls=nothing,
+    wl_buffer=1.0, precision=1e-4, postprocess=Returns(nothing),
+    time_limit=10_000, adjust_continuum=false, synthesis_kwargs...)
+# wavelengths, windows and LSF
+synthesis_wls, obs_wl_mask, LSF_matrix = _setup_wavelengths_and_LSF(obs_wls, synthesis_wls,
+                                                      LSF_matrix, R, windows,
+                                                      wl_buffer)
+
+_validate_observed_spectrum(obs_wls, obs_flux, obs_err, obs_wl_mask)
+
+initial_guesses, fixed_params = validate_params(initial_guesses, fixed_params)
+initial_guess_errors, fixed_params = validate_params(initial_guess_errors, fixed_params)
+ps = collect(pairs(scale(initial_guesses)))
+params_to_fit = first.(ps)
+p0 = last.(ps) # the initial guess as a vector of scaled values
+ps_err = collect(pairs(initial_guesses_errors)) #no scaling here
+
+@assert length(initial_guesses)>0 "Must specify at least one parameter to fit."
+@assert length(initial_guesses_errors)>0 "In priors mode you must specify prior widths/errors."
+
+chi2 = let obs_flux = obs_flux[obs_wl_mask], obs_err = obs_err[obs_wl_mask],
+obs_wls = obs_wls[obs_wl_mask], synthesis_wls = synthesis_wls, LSF_matrix = LSF_matrix,
+linelist = linelist, params_to_fit = params_to_fit, fixed_params = fixed_params
+
+function chi2(scaled_p)
+# this extremely weak prior helps to regularize the optimization
+negative_log_scaled_prior = sum(@. scaled_p^2 / 100^2)
+guess = unscale(Dict(params_to_fit .=> scaled_p))
+params = merge(guess, fixed_params)
+flux = postprocessed_synthetic_spectrum(synthesis_wls, linelist, LSF_matrix, params,
+                                  synthesis_kwargs, obs_wls, windows, obs_flux,
+                                  obs_err, postprocess, adjust_continuum)
+prior_terms = 0.0
+for name, err in ps_err
+    parameter_value = params[name]
+    #get negative log pdf of gaussian centered on initial guess with width err
+    prior_terms -= logpdf(Normal(parameter_value, err), guess[name])
+end
+
+sum(((flux .- obs_flux) ./ obs_err) .^ 2) + negative_log_scaled_prior + prior_terms
+end
+end
+
+# call optimization library
+res = optimize(chi2, p0, BFGS(; linesearch=LineSearches.BackTracking(; maxstep=1.0)),
+ Optim.Options(; x_abstol=precision, time_limit=time_limit, store_trace=true,
+               extended_trace=true); autodiff=:forward)
+
+best_fit_params = unscale(Dict(params_to_fit .=> res.minimizer))
+
+best_fit_flux = try
+full_solution = merge(best_fit_params, fixed_params)
+postprocessed_synthetic_spectrum(synthesis_wls, linelist, LSF_matrix, full_solution,
+                       synthesis_kwargs, obs_wls[obs_wl_mask], windows,
+                       obs_flux[obs_wl_mask], obs_err[obs_wl_mask],
+                       postprocess, adjust_continuum)
+catch e
+println(stderr, "Exception while synthesizing best-fit spectrum")
+rethrow(e)
+end
+
+trace = map(res.trace) do t
+unscaled_params = unscale(Dict(params_to_fit .=> t.metadata["x"]))
+unscaled_params["chi2"] = t.value
+unscaled_params
+end
+
+invH = let
+# derivate relating the scaled parameters to the unscaled parameters
+# (used to convert the approximate hessian to a covariance matrix in the unscaled params)
+dp_dscaledp = map(res.minimizer, params_to_fit) do scaled_param, param_name
+ForwardDiff.derivative(scaled_param) do scaled_param
+unscale(Dict(param_name => scaled_param))[param_name]
+end
+end
+# the fact that the scaling is a diagonal operation means that we can do this as an
+# element-wise product.  If we think of ds/dp as a (diagonal) matrix, this is equivalent to
+# (ds/dp)^T * invH * (ds/dp)
+invH_scaled = res.trace[end].metadata["~inv(H)"]
+invH_scaled .* dp_dscaledp .* dp_dscaledp'
+end
+
+(best_fit_params=best_fit_params, best_fit_flux=best_fit_flux, obs_wl_mask=obs_wl_mask,
+solver_result=res, trace=trace, covariance=(params_to_fit, invH))
+end
+
 
 """
     linear_continuum_adjustment!(obs_wls, windows, model_flux, obs_flux, obs_err)
